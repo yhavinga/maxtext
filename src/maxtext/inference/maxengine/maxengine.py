@@ -1748,8 +1748,10 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
     batch = int(self.config.per_device_batch_size * self.mesh.size)
     vocab = self.config.vocab_size
 
-    # AR-mode cache so the batch dim matches generate's input shape.
-    cache_dict_abs = self._nnx_init_cache_dict(mode=MODEL_MODE_AUTOREGRESSIVE)
+    # AR-mode cache so the batch dim matches generate's input shape. Shapes only, so that the jit below makes the
+    # zeros sharded: concrete zeros made here would hold the whole cache on one device, which fails once the cache
+    # is larger than that device's memory.
+    cache_dict_abs = jax.eval_shape(functools.partial(self._nnx_init_cache_dict, mode=MODEL_MODE_AUTOREGRESSIVE))
 
     if self._compiled_init_cache_fn is None:
 
