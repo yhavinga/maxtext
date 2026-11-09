@@ -23,6 +23,10 @@ import os
 import unittest
 from unittest import mock
 
+import jax
+import jax.numpy as jnp
+import numpy as np
+
 from maxtext.common import gcloud_stub
 from maxtext.utils import gcs_utils
 
@@ -77,6 +81,34 @@ class GCloudStubTest(unittest.TestCase):
 
         self.assertTrue(hasattr(engine_api, "Engine"))
         self.assertTrue(hasattr(engine_api, "ResultTokens"))
+
+  def test_jetstream_stub_result_tokens_can_be_returned_from_jit(self):
+    """MaxEngine's jitted prefill and generate return ResultTokens, so the stub must be a pytree like JetStream's."""
+    with mock.patch.dict(os.environ, {"DECOUPLE_GCLOUD": "TRUE"}):
+      with mock.patch("maxtext.common.gcloud_stub.importlib.util.find_spec", return_value=None):
+        _, engine_api, _, _, _ = gcloud_stub.jetstream()
+
+    @jax.jit
+    def make_result(data):
+      return engine_api.ResultTokens(
+          data=data,
+          tokens_idx=(0, 1),
+          valid_idx=(1, 2),
+          length_idx=(2, 3),
+          log_prob=data * 0.5,
+          samples_per_slot=1,
+      )
+
+    data = jnp.arange(6, dtype=jnp.float32).reshape(2, 3)
+    result = make_result(data)
+
+    self.assertIsInstance(result, engine_api.ResultTokens)
+    np.testing.assert_array_equal(result.data, data)
+    np.testing.assert_array_equal(result.log_prob, data * 0.5)
+    # Only the arrays are pytree leaves; the index tuples and samples_per_slot stay static, as in JetStream.
+    self.assertEqual(len(jax.tree_util.tree_leaves(result)), 2)
+    self.assertEqual((result.tokens_idx, result.valid_idx, result.length_idx), ((0, 1), (1, 2), (2, 3)))
+    self.assertEqual(result.samples_per_slot, 1)
 
   def test_monitoring_modules_returns_stub_tuple_when_decoupled_and_missing(self):
     # Force stub path regardless of installed deps.

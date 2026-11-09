@@ -83,6 +83,11 @@ def _jetstream_stubs():
     def __init__(self, *a, **k):  # pylint: disable=unused-argument
       pass
 
+  import jax  # pylint: disable=import-outside-toplevel
+
+  # A pytree like JetStream's flax struct dataclass, so that jitted functions such as MaxEngine's prefill and
+  # generate can return it.
+  @jax.tree_util.register_pytree_node_class
   class ResultTokens:
     """Container for result token arrays used by JetStream."""
 
@@ -104,6 +109,23 @@ def _jetstream_stubs():
       self.length_idx = length_idx
       self.log_prob = log_prob
       self.samples_per_slot = samples_per_slot
+
+    def tree_flatten(self):
+      # As in JetStream, only the arrays are children; the index tuples and samples_per_slot are static.
+      return (self.data, self.log_prob), (self.tokens_idx, self.valid_idx, self.length_idx, self.samples_per_slot)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+      data, log_prob = children
+      tokens_idx, valid_idx, length_idx, samples_per_slot = aux_data
+      return cls(
+          data=data,
+          tokens_idx=tokens_idx,
+          valid_idx=valid_idx,
+          length_idx=length_idx,
+          log_prob=log_prob,
+          samples_per_slot=samples_per_slot,
+      )
 
   # Tokenizer placeholders (unused in decoupled tests due to runtime guard).
   class TokenizerParameters:  # pragma: no cover - placeholder
