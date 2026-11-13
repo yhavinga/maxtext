@@ -1094,7 +1094,11 @@ class AttentionOp(nnx.Module):
     """Absolute query and key positions for a single-token decode step over one KV cache.
 
     Prefill cache slot i holds position i. The AR cache is written in order from
-    the first decode step, so its newest valid slot holds the query token.
+    the first decode step, one slot per step, and its newest valid slot holds the
+    query token. The AR write index is shared by all batch rows, wraps modulo
+    s_len and is not reset on insert, so a request inserted while it is at s > 0
+    fills s, s+1, ... and, past the end of the cache, 0, 1, ...: its valid slots
+    form one run that may wrap, and the newest is the run's end.
 
     Returns:
       (abs_q [batch, 1, 1], abs_k [batch, 1, s_len]), or None when the cache part,
@@ -1109,8 +1113,16 @@ class AttentionOp(nnx.Module):
     if decoder_segment_ids is None:
       return None
     valid = decoder_segment_ids[:, :s_len] == DECODING_ACTIVE_SEQUENCE_INDICATOR
-    newest = jnp.max(jnp.where(valid, jnp.arange(s_len)[None, :], -1), axis=-1)[:, None, None]
-    return abs_q, abs_q - newest + slots
+    index = jnp.arange(s_len)[None, :]
+    # The highest valid slot is the newest unless the run wraps; then it ends at a valid slot followed by an
+    # invalid one. A full cache has no such slot and keeps the highest; decode loops end a request before its
+    # AR cache is full, because prefill gives the first of its at most max_target_length -
+    # max_prefill_predict_length tokens.
+    run_end = valid & ~jnp.roll(valid, -1, axis=-1)
+    newest = jnp.max(jnp.where(run_end, index, -1), axis=-1)
+    newest = jnp.where(newest >= 0, newest, jnp.max(jnp.where(valid, index, -1), axis=-1))[:, None, None]
+    wrapped = valid[:, None, :] & (slots > newest)
+    return abs_q, abs_q - newest + slots - jnp.where(wrapped, s_len, 0)
 
   def generate_attention_mask(
       self,

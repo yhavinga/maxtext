@@ -17,6 +17,8 @@
 Single-token decode attends over the prefill cache and the AR cache separately. The sliding
 window has to be measured between true token positions, which matters once the AR cache
 (`max_target_length - max_prefill_predict_length`) is longer than `sliding_window_size`.
+The AR write index is shared by all slots and wraps, so a request inserted while it is
+past 0 fills the end of the AR cache and then its start.
 """
 
 import sys
@@ -81,6 +83,20 @@ _COMMON = {
     "decode_sampling_strategy": "greedy",
     "enable_checkpointing": False,
     "skip_jax_distributed_system": True,
+}
+
+# Six layers give Gemma 3 and Gemma 4 their global layer after five local ones.
+_REUSE_MODELS = {
+    "gemma2": {"model_name": "gemma2-2b", "base_mlp_dim": 256},
+    "gemma3": {"model_name": "gemma3-4b", "base_num_decoder_layers": 6, "base_mlp_dim": 256, "use_multimodal": False},
+    "gemma4": {
+        "model_name": "gemma4-31b",
+        "base_num_decoder_layers": 6,
+        "base_mlp_dim": 256,
+        "global_head_dim": 64,
+        "global_num_kv_heads": 1,
+        "use_multimodal": False,
+    },
 }
 
 
@@ -155,6 +171,96 @@ class SlidingWindowDecodeTest(parameterized.TestCase):
     abs_q, abs_k = AttentionOp._decode_cache_positions(None, positions, segment_ids, 4, "ar")
     # The newest valid AR slot (2) holds the query token at position 9.
     np.testing.assert_array_equal(np.asarray(abs_q - abs_k)[0, 0], [2, 1, 0, -1])
+
+  def test_ar_cache_positions_after_shared_index_wraps(self):
+    """Valid AR slots that wrap past the end of the cache end at the newest token, not at the last slot."""
+    positions = jnp.array([[9], [9], [9]], dtype=jnp.int32)
+    segment_ids = jnp.array(
+        [
+            # Inserted at index 3, three tokens written at 3, 0 and 1.
+            [1, 1, 0, 1],
+            # Inserted at index 1, not wrapped.
+            [0, 1, 1, 0],
+            # Full: no run end, so the highest valid slot stays the newest.
+            [1, 1, 1, 1],
+        ],
+        dtype=jnp.int32,
+    )
+    # pylint: disable=protected-access
+    abs_q, abs_k = AttentionOp._decode_cache_positions(None, positions, segment_ids, 4, "ar")
+    np.testing.assert_array_equal(
+        np.asarray(abs_q - abs_k)[:, 0],
+        [[1, 0, -1, 2], [2, 1, 0, -1], [3, 2, 1, 0]],
+    )
+
+  @parameterized.named_parameters(
+      ("gemma2_ar_cache_longer_than_window", "gemma2", 24),
+      ("gemma3_ar_cache_longer_than_window", "gemma3", 24),
+      ("gemma4_ar_cache_longer_than_window", "gemma4", 24),
+      ("gemma4_ar_cache_within_window", "gemma4", 8),
+  )
+  def test_decode_matches_forward_after_shared_ar_index_wraps(self, family, ar_cache):
+    """A request inserted into a second slot while the shared AR index is halfway decodes past the wrap.
+
+    Slot 0 decodes `ar_cache // 2` steps first, so the request in slot 1 starts at that AR index and
+    wraps after `ar_cache - ar_cache // 2` steps. It decodes `ar_cache - 1` steps, the most a request
+    can: prefill gives the first of at most `ar_cache` tokens.
+    """
+    overrides = {
+        **_COMMON,
+        **_REUSE_MODELS[family],
+        "max_target_length": _COMMON["max_prefill_predict_length"] + ar_cache,
+        "per_device_batch_size": 2,
+    }
+    cfg = pyconfig.initialize([sys.argv[0], get_test_config_path()], **overrides)
+    mesh = jax.sharding.Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
+    with nn_partitioning.axis_rules(cfg.logical_axis_rules), mesh:
+      model = model_creation_utils.create_model(cfg, mesh, model_mode=MODEL_MODE_PREFILL, rngs=nnx.Rngs(params=0))
+    _, params_state, _ = nnx.split(model, nnx.Param, ...)
+    leaves, treedef = jax.tree.flatten(params_state)
+    keys = jax.random.split(jax.random.PRNGKey(7), len(leaves))
+    leaves = [jax.random.normal(k, x.shape, x.dtype) * 0.2 for k, x in zip(keys, leaves)]
+    params_state = jax.tree.unflatten(treedef, leaves)
+
+    engine = maxengine.MaxEngine(cfg, jax.devices())
+    params = engine.load_params(params=params_state)
+
+    def prefill(prompt):
+      padded = jnp.asarray(prompt + [0] * (cfg.max_prefill_predict_length - len(prompt)), dtype=jnp.int32)
+      return engine.prefill(params=params, padded_tokens=padded, true_length=len(prompt))
+
+    first_prefix, _ = prefill([11, 23, 7, 61, 2])
+    state = engine.insert(first_prefix, engine.init_decode_state(), slot=0)
+    for _ in range(ar_cache // 2):
+      state, _ = engine.generate(params, state)
+    prefix, first_token = prefill(PROMPT)
+    tokens = list(PROMPT) + [int(first_token.data[0, 0])]
+    decode_logits = [np.asarray(prefix["logits"], np.float64).reshape(-1)[-cfg.vocab_size :]]
+    state = engine.insert(prefix, state, slot=1)
+    for _ in range(ar_cache - 1):
+      state, result = engine.generate(params, state)
+      decode_logits.append(np.asarray(state["logits"][1], np.float64).reshape(-1)[-cfg.vocab_size :])
+      tokens.append(int(result.data[1, 0]))
+
+    with nn_partitioning.axis_rules(cfg.logical_axis_rules), mesh:
+      train_model = model_creation_utils.create_model(cfg, mesh, model_mode=MODEL_MODE_TRAIN, rngs=nnx.Rngs(params=0))
+    nnx.update(train_model, params_state)
+    seq, batch = cfg.max_target_length, cfg.micro_batch_size_to_train_on
+    ids = jnp.tile(jnp.asarray([tokens + [0] * (seq - len(tokens))], dtype=jnp.int32), (batch, 1))
+    positions = jnp.tile(jnp.arange(seq, dtype=jnp.int32)[None], (batch, 1))
+    segment_ids = jnp.tile(jnp.asarray([[1] * len(tokens) + [0] * (seq - len(tokens))], dtype=jnp.int32), (batch, 1))
+    with nn_partitioning.axis_rules(cfg.logical_axis_rules), mesh:
+      ref = train_model(
+          ids, positions, decoder_segment_ids=segment_ids, enable_dropout=False, model_mode=MODEL_MODE_TRAIN
+      )
+    ref = np.asarray(ref[0] if isinstance(ref, tuple) else ref, np.float64)[0]
+
+    rels = [
+        float(np.max(np.abs(d - ref[len(PROMPT) - 1 + k])) / np.max(np.abs(ref[len(PROMPT) - 1 + k])))
+        for k, d in enumerate(decode_logits)
+    ]
+    worst = int(np.argmax(rels))
+    self.assertLessEqual(rels[worst], REL_TOL, f"decode step {worst} rel max-abs {rels[worst]:.3e}")
 
 
 if __name__ == "__main__":
